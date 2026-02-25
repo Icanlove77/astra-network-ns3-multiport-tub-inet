@@ -392,7 +392,7 @@ namespace ns3 {
 				m_node->SwitchReceiveFromDevice(this, packet, ch);
 			}else { // NIC
 				// send to RdmaHw
-				int ret = m_rdmaReceiveCb(packet, ch);
+				int ret = m_rdmaReceiveCb(packet, ch, this);
 				// TODO we may based on the ret do something
 			}
 		}

@@ -9,9 +9,12 @@
 #include "ns3/data-rate.h"
 #include "ns3/pointer.h"
 #include "rdma-hw.h"
+#include "ns3/log.h"
 #include "ppp-header.h"
 #include "qbb-header.h"
 #include "cn-header.h"
+
+NS_LOG_COMPONENT_DEFINE("RdmaHw");
 
 namespace ns3{
 
@@ -199,7 +202,7 @@ void RdmaHw::Setup(QpCompleteCallback cb){
 		// share data with NIC
 		dev->m_rdmaEQ->m_qpGrp = m_nic[i].qpGrp;
 		// setup callback
-		dev->m_rdmaReceiveCb = MakeCallback(&RdmaHw::Receive, this);
+		dev->m_rdmaReceiveCb = MakeCallback(&RdmaHw::ReceiveWithNetDev, this);
 		dev->m_rdmaLinkDownCb = MakeCallback(&RdmaHw::SetLinkDown, this);
 		dev->m_rdmaPktSent = MakeCallback(&RdmaHw::PktSent, this);
 		// config NIC
@@ -497,6 +500,75 @@ int RdmaHw::Receive(Ptr<Packet> p, CustomHeader &ch){
 		ReceiveAck(p, ch);
 	}
 	return 0;
+}
+
+int RdmaHw::ReceiveWithNetDev(Ptr<Packet> p, CustomHeader& ch, Ptr<QbbNetDevice> dev)
+{
+	// Verify destination IP matches one of this nodes IP addresses
+	// Usually the important address is ipv4->GetAddress(1,0).GetLocal().m_address
+    Ptr<Ipv4> ipv4 = m_node->GetObject<Ipv4>();
+    bool destinedHere = false;
+    for (uint32_t i = 0; i < ipv4->GetNInterfaces(); i++)
+    {
+        for (uint32_t j = 0; j < ipv4->GetNAddresses(i); j++)
+        {
+            Ipv4Address addr = ipv4->GetAddress(i, j).GetLocal();
+            if (addr == Ipv4Address(ch.dip))
+            {
+                destinedHere = true;
+                break;
+            }
+        }
+        if (destinedHere)
+            break;
+    }
+
+    if (!destinedHere)
+    {
+			// interface that the packet was received on
+			uint32_t ingressIfIndex = dev->GetIfIndex();
+			// verify NetDevice perspective on the interface index == perspective of RdmaHW index in m_nic[]
+			NS_ASSERT(m_nic[ingressIfIndex].dev = dev);
+            return ForwardPacketOnOtherDev(p, dev, ch);
+
+    }
+
+	//original Receive function for normal RDMA packets meant for this node
+	return Receive(p, ch);
+}
+
+// Assuming 1-D directly connected ring: forward this packet along the ring in the same direction
+// by sending it out of the other interface, compared to the interface that the packet was not received on
+// (total 2 non-loopback devices)
+// TODO in the future use local route table with packet->header->dst.ip; ensure the route table is set correctly in common.h
+int RdmaHw::ForwardPacketOnOtherDev(Ptr<Packet> packet, Ptr<QbbNetDevice> inDev, CustomHeader& ch){
+
+	// Identify the other (outgoing) interface in m_nic
+    Ptr<QbbNetDevice> outDev = nullptr;
+
+    for (const auto& nic : m_nic)
+    {
+        if (nic.dev != nullptr && nic.dev != inDev)
+        {
+            outDev = nic.dev;
+            break;
+        }
+    }
+
+    if (outDev == nullptr)
+    {
+		// error: we only landed here when trying to simulate direct-connected ring
+        NS_FATAL_ERROR("RdmaHw::ForwardPacketOnOtherDev: No suitable output device found.");
+        return 1;
+    }
+
+    // Forward the packet using the highest priority RDMA queue (ackQ)
+	// Using highestPrioQ to ensure forwarding - this preempting essentially simulates our congestion factor
+    printf("Node %d : Received packet from dev %p , forwarding to dev %p. \n", m_node->GetId(), PeekPointer(inDev), PeekPointer(outDev));
+	outDev->m_rdmaEQ->m_ackQ->Enqueue(packet);
+    outDev->TriggerTransmit();
+
+    return 0;
 }
 
 int RdmaHw::ReceiverCheckSeq(uint32_t seq, Ptr<RdmaRxQueuePair> q, uint32_t size){

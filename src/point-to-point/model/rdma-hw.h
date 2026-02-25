@@ -37,7 +37,7 @@ public:
 	bool m_backto0;
 	bool m_var_win, m_fast_react;
 	bool m_rateBound;
-	uint32_t m_total_pause_times; 
+	uint32_t m_total_pause_times;
 	uint32_t m_paused_times;
 	std::vector<RdmaInterfaceMgr> m_nic; // list of running nic controlled by this RdmaHw
 	std::unordered_map<uint64_t, Ptr<RdmaQueuePair> > m_qpMap; // mapping from uint64_t to qp
@@ -64,11 +64,12 @@ public:
 	int ReceiveCnp(Ptr<Packet> p, CustomHeader &ch);
 	int ReceiveAck(Ptr<Packet> p, CustomHeader &ch); // handle both ACK and NACK
 	int Receive(Ptr<Packet> p, CustomHeader &ch); // callback function that the QbbNetDevice should use when receive packets. Only NIC can call this function. And do not call this upon PFC
-
+	int ReceiveWithNetDev(Ptr<Packet> p, CustomHeader& ch, Ptr<QbbNetDevice> dev);
 	void PCIePause(uint32_t nic_idx, uint32_t qIndex);
+    int ForwardPacketOnOtherDev(Ptr<Packet> packet, Ptr<QbbNetDevice> inDev, CustomHeader& ch); // for static, direct-connected rings and only forwarding at intermediate nodes
 	void PCIeResume(uint32_t nic_idx, uint32_t qIndex);
 	void EnablePause();
-	bool enable_pcie_pause; 
+	bool enable_pcie_pause;
 
 	void CheckandSendQCN(Ptr<RdmaRxQueuePair> q);
 	int ReceiverCheckSeq(uint32_t seq, Ptr<RdmaRxQueuePair> q, uint32_t size);

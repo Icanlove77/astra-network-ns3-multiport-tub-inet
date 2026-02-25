@@ -36,6 +36,7 @@
 #include <ns3/switch-node.h>
 #include <time.h>
 #include <unordered_map>
+#include <cstdlib>
 
 using namespace ns3;
 using namespace std;
@@ -206,7 +207,7 @@ void monitor_buffer(FILE *qlen_output, NodeContainer *n) {
                       qlen_output, n);
 }
 
-void CalculateRoute(Ptr<Node> host) {
+void CalculateRoute(Ptr<Node> host, bool node_forwarding) {
   // queue for the BFS.
   vector<Ptr<Node>> q;
   // Distance from the host to each node.
@@ -235,7 +236,7 @@ void CalculateRoute(Ptr<Node> host) {
         txDelay[next] = txDelay[now] +
                         packet_payload_size * 1000000000lu * 8 / it->second.bw;
         bw[next] = std::min(bw[now], it->second.bw);
-        if (next->GetNodeType() == 1)
+        if (node_forwarding || next->GetNodeType() == 1)
           q.push_back(next);
       }
       if (d + 1 == dis[next]) {
@@ -258,11 +259,18 @@ void CalculateRoute(Ptr<Node> host) {
 }
 
 void CalculateRoutes(NodeContainer &n) {
-  for (int i = 0; i < (int)n.GetN(); i++) {
-    Ptr<Node> node = n.Get(i);
-    if (node->GetNodeType() == 0)
-      CalculateRoute(node);
-  }
+       // should routes include paths via other intermediate (non-switch) nodes
+    const char* env = std::getenv("ENABLE_NODE_FORWARDING");
+    bool node_forwarding = (env != nullptr && std::atoi(env) > 0);
+    NS_LOG_INFO("Value of ENABLE_NODE_FORWARDING: " + node_forwarding);
+
+
+    for (int i = 0; i < (int)n.GetN(); i++)
+    {
+        Ptr<Node> node = n.Get(i);
+        if (node->GetNodeType() == 0)
+            CalculateRoute(node, node_forwarding);
+    }
 }
 
 void SetRoutingEntries() {
@@ -331,7 +339,7 @@ bool ReadConf(string network_configuration) {
     fflush(stdout);
     return false;
   }
-  
+
   while (!conf.eof()) {
     std::string key;
     conf >> key;
