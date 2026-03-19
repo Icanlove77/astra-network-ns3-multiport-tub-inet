@@ -537,38 +537,122 @@ int RdmaHw::ReceiveWithNetDev(Ptr<Packet> p, CustomHeader& ch, Ptr<QbbNetDevice>
 	return Receive(p, ch);
 }
 
-// Assuming 1-D directly connected ring: forward this packet along the ring in the same direction
-// by sending it out of the other interface, compared to the interface that the packet was not received on
-// (total 2 non-loopback devices)
-// TODO in the future use local route table with packet->header->dst.ip; ensure the route table is set correctly in common.h
-int RdmaHw::ForwardPacketOnOtherDev(Ptr<Packet> packet, Ptr<QbbNetDevice> inDev, CustomHeader& ch){
 
-	// Identify the other (outgoing) interface in m_nic
-    Ptr<QbbNetDevice> outDev = nullptr;
-
-    for (const auto& nic : m_nic)
+// use local route table with packet->header->dst.ip; 
+// TODO: 1. ensure the route table is set correctly in common.h
+//	     2. verify if the forwarding logic also apply to torus network
+int RdmaHw::ForwardPacketOnOtherDev(Ptr<Packet> packet, Ptr<QbbNetDevice> inDev, CustomHeader& ch)
+{
+    int nicIdx = GetOutNicIdxForRelay(ch, inDev);
+    if (nicIdx < 0)
     {
-        if (nic.dev != nullptr && nic.dev != inDev)
-        {
-            outDev = nic.dev;
-            break;
-        }
-    }
-
-    if (outDev == nullptr)
-    {
-		// error: we only landed here when trying to simulate direct-connected ring
-        NS_FATAL_ERROR("RdmaHw::ForwardPacketOnOtherDev: No suitable output device found.");
+        NS_LOG_ERROR("RdmaHw::ForwardPacketOnOtherDev: no usable route for dst="
+                     << Ipv4Address(ch.dip));
         return 1;
     }
 
-    // Forward the packet using the highest priority RDMA queue (ackQ)
-	// Using highestPrioQ to ensure forwarding - this preempting essentially simulates our congestion factor
-    printf("Node %d : Received packet from dev %p , forwarding to dev %p. \n", m_node->GetId(), PeekPointer(inDev), PeekPointer(outDev));
-	outDev->m_rdmaEQ->m_ackQ->Enqueue(packet);
-    outDev->TriggerTransmit();
+    Ptr<QbbNetDevice> outDev = m_nic[nicIdx].dev;
 
+// print forwarding-pakcet info
+    std::cout << "[FWD] node=" << m_node->GetId()
+          << " sip=" << Ipv4Address(ch.sip)
+          << " dip=" << Ipv4Address(ch.dip)
+          << " inIf=" << inDev->GetIfIndex()
+          << " outIf=" << nicIdx
+          << std::endl;
+
+    outDev->m_rdmaEQ->m_ackQ->Enqueue(packet);
+    outDev->TriggerTransmit();
     return 0;
+}
+
+// use routing table to find the output NIC index for packet relay
+int RdmaHw::GetOutNicIdxForRelay(CustomHeader& ch, Ptr<QbbNetDevice> inDev)
+{
+    auto entry = m_rtTable.find(ch.dip);
+    if (entry == m_rtTable.end() || entry->second.empty())
+        return -1;
+
+    auto &nexthops = entry->second;
+
+    union {
+        uint8_t u8[4+4+2+2];
+        uint32_t u32[3];
+    } buf;
+	
+    buf.u32[0] = ch.sip;
+    buf.u32[1] = ch.dip;
+
+    if (ch.l3Prot == 0x6) {              // TCP
+        buf.u32[2] = ch.tcp.sport | ((uint32_t)ch.tcp.dport << 16);
+    } else if (ch.l3Prot == 0x11) {      // UDP
+        buf.u32[2] = ch.udp.sport | ((uint32_t)ch.udp.dport << 16);
+    } else if (ch.l3Prot == 0xFC || ch.l3Prot == 0xFD) { // ACK / NACK-like
+        buf.u32[2] = ch.ack.sport | ((uint32_t)ch.ack.dport << 16);
+    } else {
+        buf.u32[2] = 0;
+    }
+
+    uint32_t start = EcmpHash(buf.u8, 12, 0) % nexthops.size();
+    // Prefer an egress NIC different from ingress NIC.
+    for (uint32_t k = 0; k < nexthops.size(); ++k)
+    {
+        int nicIdx = nexthops[(start + k) % nexthops.size()];
+
+		if (nicIdx < 0 || (size_t)nicIdx >= m_nic.size())
+			continue;
+
+		if (m_nic[nicIdx].dev == nullptr)
+			continue;
+
+		if (m_nic[nicIdx].dev == inDev)
+			continue;
+
+		return nicIdx;
+    }
+
+    return -1;
+}
+
+//ecmphash copied from switch-node.cc. we leave the seed to 0 for simplicity, but it can be configured if needed.
+uint32_t RdmaHw::EcmpHash(const uint8_t* key, size_t len, uint32_t seed) {
+	uint32_t h = seed;
+	if (len > 3) 
+	{
+		const uint32_t* key_x4 = (const uint32_t*) key;
+		size_t i = len >> 2;
+		do {
+			uint32_t k = *key_x4++;
+			k *= 0xcc9e2d51;
+			k = (k << 15) | (k >> 17);
+			k *= 0x1b873593;
+			h ^= k;
+			h = (h << 13) | (h >> 19);
+			h += (h << 2) + 0xe6546b64;
+		} while (--i);
+		key = (const uint8_t*) key_x4;
+	}
+	if (len & 3) 
+	{
+		size_t i = len & 3;
+		uint32_t k = 0;
+		key = &key[i - 1];
+		do {
+			k <<= 8;
+			k |= *key--;
+		} while (--i);
+		k *= 0xcc9e2d51;
+		k = (k << 15) | (k >> 17);
+		k *= 0x1b873593;
+		h ^= k;
+	}
+	h ^= len;
+	h ^= h >> 16;
+	h *= 0x85ebca6b;
+	h ^= h >> 13;
+	h *= 0xc2b2ae35;
+	h ^= h >> 16;
+	return h;
 }
 
 int RdmaHw::ReceiverCheckSeq(uint32_t seq, Ptr<RdmaRxQueuePair> q, uint32_t size){
